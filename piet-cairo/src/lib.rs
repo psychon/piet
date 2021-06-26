@@ -235,74 +235,53 @@ impl<'a> RenderContext for CairoRenderContext<'a> {
         let bytes_per_pixel = format.bytes_per_pixel();
         let bytes_per_row = width * bytes_per_pixel;
         let stride = image.get_stride() as usize;
+        // Rgb24 and ARgb32 both need four bytes per pixel and rounding this to a multiple of four
+        // has no effect
+        assert_eq!(stride, width * 4);
         {
             let mut data = image
                 .get_data()
                 .map_err(|e| Error::BackendError(Box::new(e)))?;
-            for y in 0..height {
-                let src_off = y * bytes_per_row;
-                let dst_off = y * stride;
-                match format {
-                    ImageFormat::Rgb => {
-                        for x in 0..width {
-                            write_rgb(
-                                &mut data,
-                                dst_off,
-                                x,
-                                buf[src_off + x * 3 + 0],
-                                buf[src_off + x * 3 + 1],
-                                buf[src_off + x * 3 + 2],
-                            );
-                        }
-                    }
-                    ImageFormat::RgbaPremul => {
-                        // It's annoying that Cairo exposes only ARGB. Ah well. Let's
-                        // hope that LLVM generates pretty good code for this.
-                        // TODO: consider adding BgraPremul format.
-                        for x in 0..width {
-                            write_rgba(
-                                &mut data,
-                                dst_off,
-                                x,
-                                buf[src_off + x * 4 + 0],
-                                buf[src_off + x * 4 + 1],
-                                buf[src_off + x * 4 + 2],
-                                buf[src_off + x * 4 + 3],
-                            );
-                        }
-                    }
-                    ImageFormat::RgbaSeparate => {
-                        fn premul(x: u8, a: u8) -> u8 {
-                            let y = (x as u16) * (a as u16);
-                            ((y + (y >> 8) + 0x80) >> 8) as u8
-                        }
-                        for x in 0..width {
-                            let a = buf[src_off + x * 4 + 3];
-                            write_rgba(
-                                &mut data,
-                                dst_off,
-                                x,
-                                premul(buf[src_off + x * 4 + 0], a),
-                                premul(buf[src_off + x * 4 + 1], a),
-                                premul(buf[src_off + x * 4 + 2], a),
-                                a,
-                            );
-                        }
-                    }
-                    ImageFormat::Grayscale => {
-                        for x in 0..width {
-                            write_rgb(
-                                &mut data,
-                                dst_off,
-                                x,
-                                buf[src_off + x],
-                                buf[src_off + x],
-                                buf[src_off + x],
-                            );
-                        }
-                    }
-                    _ => return Err(Error::NotSupported),
+            let source = &buf[0..height * bytes_per_row];
+            match format {
+                ImageFormat::Rgb => {
+                    source.chunks(bytes_per_pixel)
+                        .zip(data.chunks_mut(4))
+                        .for_each(|(src, dst)| write_rgb(dst, src[0], src[1], src[2]));
                 }
+                ImageFormat::RgbaPremul => {
+                    // It's annoying that Cairo exposes only ARGB. Ah well. Let's
+                    // hope that LLVM generates pretty good code for this.
+                    // TODO: consider adding BgraPremul format.
+                    source.chunks(4)
+                        .zip(data.chunks_mut(4))
+                        .for_each(|(src, dst)| write_rgba(dst, src[0], src[1], src[2], src[3]));
+                }
+                ImageFormat::RgbaSeparate => {
+                    fn premul(x: u8, a: u8) -> u8 {
+                        // u16 would be enough, but u32 is faster
+                        let y = (x as u32) * (a as u32);
+                        ((y + (y >> 8) + 0x80) >> 8) as u8
+                    }
+                    for pixel in 0..(width * height) {
+                        let offset = pixel * bytes_per_pixel;
+                        let a = source[offset + 3];
+                        write_rgba(
+                            &mut data[offset..offset + 4],
+                            premul(source[offset + 0], a),
+                            premul(source[offset + 1], a),
+                            premul(source[offset + 2], a),
+                            a
+                        );
+                    }
+                }
+                ImageFormat::Grayscale => {
+                    source.iter()
+                        .zip(data.chunks_mut(4))
+                        // This also writes the unused X byte in RGBX, but that's slightly faster
+                        .for_each(|(&src, dst)| dst.copy_from_slice(&[src, src, src, src]));
+                }
+                _ => return Err(Error::NotSupported),
             }
         }
         Ok(CairoImage(image))
@@ -520,19 +499,17 @@ fn compute_blurred_rect(rect: Rect, radius: f64) -> (ImageSurface, Point) {
     (image, origin)
 }
 
-fn write_rgba(data: &mut [u8], offset: usize, x: usize, r: u8, g: u8, b: u8, a: u8) {
+fn write_rgba(data: &mut [u8], r: u8, g: u8, b: u8, a: u8) {
     // From the cairo docs for CAIRO_FORMAT_ARGB32:
     //  each pixel is a 32-bit quantity, with alpha in the upper 8 bits, then red,
     //  then green, then blue. The 32-bit quantities are stored native-endian.
     let (a, r, g, b) = (u32::from(a), u32::from(r), u32::from(g), u32::from(b));
     let pixel = a << 24 | r << 16 | g << 8 | b;
-
-    let pixel_offset = offset + 4 * x;
-    data[pixel_offset..pixel_offset + 4].copy_from_slice(&pixel.to_ne_bytes());
+    data.copy_from_slice(&pixel.to_ne_bytes());
 }
 
-fn write_rgb(data: &mut [u8], offset: usize, x: usize, r: u8, g: u8, b: u8) {
+fn write_rgb(data: &mut [u8], r: u8, g: u8, b: u8) {
     // From the cairo docs for CAIRO_FORMAT_RGB24:
     //  each pixel is a 32-bit quantity, with the upper 8 bits unused.
-    write_rgba(data, offset, x, r, g, b, 0);
+    write_rgba(data, r, g, b, 0);
 }
